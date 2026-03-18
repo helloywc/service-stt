@@ -1,0 +1,21 @@
+[project]
+name = "service-stt"
+version = "0.0.94"
+description = "离线语音识别转文字工具，基于 faster-whisper"
+readme = "README.md"
+requires-python = ">=3.9,<3.12"
+dependencies = [
+    "torch==2.1.2",
+    "numpy<2",
+    "flask",
+    "requests",
+    "gevent",
+    "faster-whisper",
+    "fsspec",
+    "opencc-python-reimplemented",
+    "python-dotenv",
+    "pymysql",
+    "flask-cors",
+    "yt-dlp",
+]
+
