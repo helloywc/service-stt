@@ -1,9 +1,6 @@
 venv
 .venv
 .uv
-.env
-.env.development
-.env.production
 .idea
 build
 dist
