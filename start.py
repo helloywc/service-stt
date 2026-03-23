@@ -633,11 +633,12 @@ def stop_start():
 def start_status():
     """查询 /start 任务是否正在执行。"""
     try:
+        running = bool(getattr(cfg, "START_RUNNING", False))
         return jsonify({
             "code": 200,
-            "message": "ok",
+            "message": "running" if running else "not running",
             "data": {
-                "running": bool(getattr(cfg, "START_RUNNING", False))
+                "running": running
             }
         }), 200
     except Exception as e:
