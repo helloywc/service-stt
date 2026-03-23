@@ -5,10 +5,23 @@ import re
 
 ROOT_DIR = os.getcwd()
 
-# 按 APP_ENV 加载对应 env 文件（默认 dev）
+# 行业标准 env 加载：
+# 1) 先加载通用变量 .env
+# 2) 再按 APP_ENV 加载环境专属变量 .env.development / .env.production
 from dotenv import load_dotenv
-_APP_ENV = os.getenv("APP_ENV", "dev")
-_env_file = os.path.join(ROOT_DIR, "env", f"{_APP_ENV}.env")
+_default_env_file = os.path.join(ROOT_DIR, ".env")
+if os.path.isfile(_default_env_file):
+    load_dotenv(_default_env_file)
+
+_APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+_mode_map = {
+    "dev": "development",
+    "development": "development",
+    "prod": "production",
+    "production": "production",
+}
+_mode = _mode_map.get(_APP_ENV, _APP_ENV)
+_env_file = os.path.join(ROOT_DIR, f".env.{_mode}")
 if os.path.isfile(_env_file):
     load_dotenv(_env_file)
 
@@ -74,6 +87,19 @@ else :
     cc = None
 
 web_address=sets.get('web_address')
+# 支持通过 env 覆盖启动端口（WEB_PORT），或直接覆盖地址（WEB_ADDRESS）
+_env_web_address = os.getenv("WEB_ADDRESS")
+if _env_web_address:
+    web_address = _env_web_address
+else:
+    _web_port = os.getenv("WEB_PORT")
+    if _web_port:
+        _web_port = str(_web_port).strip()
+        if ':' in str(web_address):
+            _web_host = str(web_address).split(':', 1)[0]
+        else:
+            _web_host = '127.0.0.1'
+        web_address = f"{_web_host}:{_web_port}"
 LANG=sets.get('lang','zh')
 if LANG=='zh':
     os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'

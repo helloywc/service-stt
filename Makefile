@@ -2,16 +2,16 @@
 .DEFAULT_GOAL := help
 
 dev run:
-	START_OPEN_WEB=0 uv run python start.py
+	APP_ENV=development START_OPEN_WEB=0 uv run python start.py
 
 run-web:
-	START_OPEN_WEB=1 uv run python start.py
+	APP_ENV=development START_OPEN_WEB=1 uv run python start.py
 
 run-dev:
-	APP_ENV=dev uv run python start.py
+	APP_ENV=development uv run python start.py
 
 run-prod:
-	APP_ENV=prod uv run python start.py
+	APP_ENV=production uv run python start.py
 
 install sync:
 	uv sync

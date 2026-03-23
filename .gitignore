@@ -2,8 +2,8 @@ venv
 .venv
 .uv
 .env
-env/dev.env
-env/prod.env
+.env.development
+.env.production
 .idea
 build
 dist
