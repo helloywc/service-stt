@@ -595,45 +595,55 @@ def start():
         table = request.form.get("table") or body.get("table")
         platform = request.form.get("platform") or body.get("platform") or "bili"
         if not table:
-            return jsonify({"code": 1, "msg": "缺少参数 table"}), 500
+            return jsonify({"code": 500, "message": "缺少参数 table"}), 500
         if table != "bilibili_video":
-            return jsonify({"code": 1, "msg": f"暂不支持表: {table}"}), 500
+            return jsonify({"code": 500, "message": f"暂不支持表: {table}"}), 500
         # 若已在运行，则直接返回
         if getattr(cfg, "START_RUNNING", False):
-            return jsonify({"code": 0, "msg": "任务已在运行中"}), 200
+            return jsonify({"code": 200, "message": "任务已在运行中"}), 200
         # 后台启动任务线程
         t = threading.Thread(target=_run_start_task, args=(platform,), daemon=True)
         t.start()
-        return jsonify({"code": 0, "msg": "任务已启动"}), 200
+        return jsonify({"code": 200, "message": "任务已启动"}), 200
     except Exception as e:
         cfg.LAST_ERROR_MSG = str(e)
         app.logger.error(f"[start] error: {e}")
-        return jsonify({"code": 1, "msg": str(e)}), 500
+        return jsonify({"code": 500, "message": str(e)}), 500
 
 
 @app.route('/last_error', methods=['GET'])
 def last_error():
     """获取上一次 /start 执行时的错误原因（进程级内存记录）。"""
-    return jsonify({"code": 0, "msg": "ok", "data": getattr(cfg, "LAST_ERROR_MSG", "")}), 200
+    return jsonify({"code": 200, "message": "ok", "data": getattr(cfg, "LAST_ERROR_MSG", "")}), 200
 
 
 @app.route('/start/stop', methods=['POST'])
 def stop_start():
     """标记停止 /start 任务的继续执行。仅影响当前进程内的后续循环。"""
-    cfg.STOP_START = True
-    return jsonify({"code": 0, "msg": "stop signal sent"}), 200
+    try:
+        cfg.STOP_START = True
+        return jsonify({"code": 200, "message": "stop signal sent"}), 200
+    except Exception as e:
+        cfg.LAST_ERROR_MSG = str(e)
+        app.logger.error(f"[start/stop] error: {e}")
+        return jsonify({"code": 500, "message": str(e)}), 500
 
 
 @app.route('/start/status', methods=['GET'])
 def start_status():
     """查询 /start 任务是否正在执行。"""
-    return jsonify({
-        "code": 0,
-        "msg": "ok",
-        "data": {
-            "running": bool(getattr(cfg, "START_RUNNING", False))
-        }
-    }), 200
+    try:
+        return jsonify({
+            "code": 200,
+            "message": "ok",
+            "data": {
+                "running": bool(getattr(cfg, "START_RUNNING", False))
+            }
+        }), 200
+    except Exception as e:
+        cfg.LAST_ERROR_MSG = str(e)
+        app.logger.error(f"[start/status] error: {e}")
+        return jsonify({"code": 500, "message": str(e)}), 500
 
 
 @app.route('/checkupdate', methods=['GET', 'POST'])
