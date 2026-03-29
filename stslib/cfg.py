@@ -115,8 +115,12 @@ TMP_DIR = os.path.join(STATIC_DIR, 'tmp')
 progressbar={}
 progressresult={}
 LAST_ERROR_MSG = ""
+LAST_STOP_MESSAGE = ""
 STOP_START = False
 START_RUNNING = False
+# /start 当前任务使用的数据库连接参数（供 /start/stop 写入同一库）
+START_TASK_DB_KWARGS = None
+START_TASK_ENV_LABEL = None
 
 
 if not os.path.exists(TMP_DIR):

@@ -980,4 +980,18 @@ CREATE TABLE `crawler_task_records` (
     INDEX `idx_add_ts` (`add_ts`)
 ) ENGINE=INNODB DEFAULT CHARSET=UTF8MB4 COLLATE=UTF8MB4_0900_AI_CI COMMENT='爬虫任务执行记录表(快照)';
 
+-- ----------------------------
+-- STT 服务停止事件（/start/stop 写入，便于按环境区分库）
+-- ----------------------------
+DROP TABLE IF EXISTS `stt_stop_log`;
+CREATE TABLE `stt_stop_log` (
+    `id`         BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增ID',
+    `env`        VARCHAR(16)  NOT NULL DEFAULT ''     COMMENT 'start 入参 env: dev|prod',
+    `reason`     VARCHAR(512) NOT NULL DEFAULT ''     COMMENT '停止原因',
+    `add_ts`     BIGINT       NOT NULL                 COMMENT '记录时间戳(毫秒)',
+    PRIMARY KEY (`id`),
+    KEY `idx_add_ts` (`add_ts`),
+    KEY `idx_env` (`env`)
+) ENGINE=INNODB DEFAULT CHARSET=UTF8MB4 COLLATE=UTF8MB4_0900_AI_CI COMMENT='STT /start/stop 停止记录';
+
 SET FOREIGN_KEY_CHECKS = 1;

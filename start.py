@@ -22,6 +22,7 @@ import json
 import pymysql
 from pymysql.cursors import DictCursor
 import yt_dlp
+from dotenv import dotenv_values
 
 class CustomRequestHandler(WSGIHandler):
     def log_request(self):
@@ -431,6 +432,67 @@ def _cookies_header_from_db(cookies_value):
     return s if "=" in s else None
 
 
+def _merge_dotenv_files(*rel_paths):
+    """按顺序合并多个 .env 文件，后者覆盖前者（值非空才写入）。"""
+    merged = {}
+    for rel in rel_paths:
+        path = os.path.join(ROOT_DIR, rel)
+        if not os.path.isfile(path):
+            continue
+        for k, v in dotenv_values(path).items():
+            if v is not None and str(v).strip() != "":
+                merged[k] = str(v).strip()
+    return merged
+
+
+def _pymysql_connect_kw_for_start_env(start_env: str):
+    """start 入参 env 为 dev|prod：用 .env + 对应环境文件的 DB_PORT 等连接数据库。"""
+    if start_env == "dev":
+        m = _merge_dotenv_files(".env", ".env.development")
+    elif start_env == "prod":
+        m = _merge_dotenv_files(".env", ".env.production")
+    else:
+        raise ValueError("env 只能是 dev 或 prod")
+
+    def pick(key, default=None):
+        if key in m and m[key] is not None:
+            return m[key]
+        return os.getenv(key, default)
+
+    port_s = pick("DB_PORT", "3306")
+    try:
+        port = int(port_s)
+    except (TypeError, ValueError):
+        port = 3306
+    return {
+        "host": pick("DB_HOST", "127.0.0.1"),
+        "port": port,
+        "user": pick("DB_USER", "root"),
+        "password": pick("DB_PASSWORD", "") or "",
+        "database": pick("DB_NAME", "media_operator"),
+        "charset": "utf8mb4",
+    }
+
+
+def _record_stop_to_db(db_kw: dict, env_label: str, reason: str):
+    """将停止原因写入当前任务使用的数据库（表 stt_stop_log，见 schema/table.sql）。"""
+    table = os.getenv("STT_STOP_LOG_TABLE", "stt_stop_log").strip() or "stt_stop_log"
+    safe_table = "".join(c for c in table if c.isalnum() or c == "_")
+    if safe_table != table:
+        raise ValueError("STT_STOP_LOG_TABLE 仅允许字母数字下划线")
+    kw = {k: v for k, v in db_kw.items() if k in ("host", "port", "user", "password", "database", "charset")}
+    conn = pymysql.connect(**kw)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO `{safe_table}` (env, reason, add_ts) VALUES (%s, %s, %s)",
+                (env_label or "", reason[:512], int(time.time() * 1000)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _download_bilibili_audio(video_url, cookies_str, out_dir, video_id):
     """用 yt-dlp 下载 B 站视频音频到 out_dir，转为 16k 单声道 wav，返回 wav 文件路径。"""
     safe_id = re.sub(r"[^\w\-]", "_", str(video_id))[:64]
@@ -459,23 +521,29 @@ def _download_bilibili_audio(video_url, cookies_str, out_dir, video_id):
     return wav_path
 
 
-def _run_start_task(platform: str):
+def _run_start_task(platform: str, start_env: str):
     """实际执行 bilibili_video 批量处理任务的后台函数。"""
+    db_kw = _pymysql_connect_kw_for_start_env(start_env)
     print(
-        "[start] 当前数据库配置:",
-        f"host={cfg.DB_HOST} port={cfg.DB_PORT} user={cfg.DB_USER} password=**** database={cfg.DB_NAME}",
+        "[start] 当前数据库配置 (env=%s):" % start_env,
+        f"host={db_kw['host']} port={db_kw['port']} user={db_kw['user']} password=**** database={db_kw['database']}",
     )
     cfg.START_RUNNING = True
     cfg.STOP_START = False
-    conn = pymysql.connect(
-            host=cfg.DB_HOST,
-            port=cfg.DB_PORT,
-            user=cfg.DB_USER,
-            password=cfg.DB_PASSWORD,
-            database=cfg.DB_NAME,
-            charset="utf8mb4",
+    conn = None
+    try:
+        conn = pymysql.connect(
+            **db_kw,
             cursorclass=DictCursor,
         )
+    except Exception as e:
+        cfg.START_RUNNING = False
+        cfg.START_TASK_DB_KWARGS = None
+        cfg.START_TASK_ENV_LABEL = None
+        cfg.LAST_ERROR_MSG = str(e)
+        app.logger.error(f"[start] 数据库连接失败: {e}")
+        raise
+
     processed = 0
     last_data = None
     try:
@@ -585,7 +653,10 @@ def _run_start_task(platform: str):
                         pass
     finally:
         cfg.START_RUNNING = False
-        conn.close()
+        cfg.START_TASK_DB_KWARGS = None
+        cfg.START_TASK_ENV_LABEL = None
+        if conn is not None:
+            conn.close()
 
 
 @app.route('/start', methods=['POST'])
@@ -595,15 +666,24 @@ def start():
         body = request.get_json(silent=True) or {}
         table = request.form.get("table") or body.get("table")
         platform = request.form.get("platform") or body.get("platform") or "bili"
+        start_env = (request.form.get("env") or body.get("env") or "").strip().lower()
         if not table:
             return jsonify({"code": 500, "message": "缺少参数 table"}), 500
         if table != "bilibili_video":
             return jsonify({"code": 500, "message": f"暂不支持表: {table}"}), 500
+        if start_env not in ("dev", "prod"):
+            return jsonify({"code": 500, "message": "参数 env 只能是 dev 或 prod"}), 500
         # 若已在运行，则直接返回
         if getattr(cfg, "START_RUNNING", False):
             return jsonify({"code": 200, "message": "任务已在运行中"}), 200
-        # 后台启动任务线程
-        t = threading.Thread(target=_run_start_task, args=(platform,), daemon=True)
+        try:
+            _pre_kw = _pymysql_connect_kw_for_start_env(start_env)
+        except Exception as e:
+            return jsonify({"code": 500, "message": str(e)}), 500
+        cfg.START_TASK_DB_KWARGS = {k: v for k, v in _pre_kw.items()}
+        cfg.START_TASK_ENV_LABEL = start_env
+        # 后台启动任务线程（与上方 DB 配置一致，供 /start/stop 写入同一库）
+        t = threading.Thread(target=_run_start_task, args=(platform, start_env), daemon=True)
         t.start()
         return jsonify({"code": 200, "message": "任务已启动"}), 200
     except Exception as e:
@@ -622,7 +702,16 @@ def last_error():
 def stop_start():
     """标记停止 /start 任务的继续执行。仅影响当前进程内的后续循环。"""
     try:
+        db_kw = getattr(cfg, "START_TASK_DB_KWARGS", None)
+        env_label = getattr(cfg, "START_TASK_ENV_LABEL", None) or ""
+        reason = "STT 批量任务：用户调用 /start/stop 请求停止"
         cfg.STOP_START = True
+        if db_kw:
+            try:
+                _record_stop_to_db(db_kw, env_label, reason)
+            except Exception as log_e:
+                app.logger.warning(f"[start/stop] 写入 stt_stop_log 失败（可忽略或先执行建表 SQL）: {log_e}")
+        cfg.LAST_STOP_MESSAGE = reason
         return jsonify({"code": 200, "message": "stop signal sent"}), 200
     except Exception as e:
         cfg.LAST_ERROR_MSG = str(e)
