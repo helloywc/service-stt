@@ -2,6 +2,7 @@ import logging,shutil
 import re
 import threading
 import sys
+import argparse
 import torch
 from flask import Flask, request, render_template, jsonify, send_from_directory, Response
 from flask_cors import CORS
@@ -653,6 +654,27 @@ def checkupdate():
 
 
 if __name__ == '__main__':
+    _parser = argparse.ArgumentParser(description="service-stt")
+    _parser.add_argument(
+        "--http-addr",
+        dest="http_addr",
+        default=None,
+        metavar="HOST:PORT",
+        help="监听地址，覆盖本进程内 set.ini / 环境变量推导的端口（如 0.0.0.0:9988）",
+    )
+    _args, _unknown = _parser.parse_known_args()
+    if _args.http_addr:
+        _addr = _args.http_addr.strip()
+        if ":" not in _addr:
+            print("error: --http-addr 需为 HOST:PORT，例如 0.0.0.0:9988", file=sys.stderr)
+            sys.exit(1)
+        _host_part, _port_part = _addr.rsplit(":", 1)
+        if not _host_part or not _port_part.isdigit():
+            print("error: --http-addr 格式无效，例如 0.0.0.0:9988", file=sys.stderr)
+            sys.exit(1)
+        cfg.web_address = _addr
+        print(f"[boot] 使用 --http-addr 监听: {cfg.web_address}")
+
     http_server = None
     try:
         threading.Thread(target=tool.checkupdate).start()
@@ -660,7 +682,7 @@ if __name__ == '__main__':
         try:
             if cfg.devtype=='cpu':
                 print('\n如果设备使用英伟达显卡并且CUDA环境已正确安装，可修改set.ini中\ndevtype=cpu 为 devtype=cuda, 然后重新启动以加快识别速度\n')
-            host = cfg.web_address.split(':')
+            host = cfg.web_address.rsplit(":", 1)
             http_server = WSGIServer((host[0], int(host[1])), app, handler_class=CustomRequestHandler)
             # 根据环境变量控制是否打开浏览器，默认打开
             if os.getenv("START_OPEN_WEB", "1") == "1":
