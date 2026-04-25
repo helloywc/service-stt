@@ -542,7 +542,7 @@ def _trigger_download_via_applescript(video_url: str):
     print(f"[start] AppleScript 已触发下载, url={video_url}")
 
 
-def _wait_downie_download(download_path: str, download_id: str, timeout_sec: int = 900):
+def _wait_downie_download(download_path: str, download_id: str, timeout_sec: int = 900, no_file_grace_sec: int = 60):
     """
     监控 Downie 下载目录，返回 (video_path, meta_json_path, srt_path_or_none)。
     判定规则：
@@ -555,7 +555,9 @@ def _wait_downie_download(download_path: str, download_id: str, timeout_sec: int
         rf"^.+-{re.escape(str(download_id))}\.(downiepart|mp4|json|srt)$",
         re.IGNORECASE,
     )
-    deadline = time.time() + max(timeout_sec, 10)
+    now = time.time()
+    deadline = now + max(timeout_sec, 10)
+    no_file_deadline = now + max(no_file_grace_sec, 5)
     seen_any = False
     last_state = None
     while True:
@@ -599,6 +601,11 @@ def _wait_downie_download(download_path: str, download_id: str, timeout_sec: int
                 f"mp4={mp4_name or '-'} json={json_name or '-'} srt={srt_name or '-'}"
             )
             last_state = cur_state
+        # 触发下载后 1 分钟仍无任何相关文件，判定下载解析失败。
+        if (not seen_any) and time.time() > no_file_deadline:
+            raise RuntimeError(
+                f"download_id={download_id} 在 {max(no_file_grace_sec, 5)} 秒内无文件生成，判定解析失败"
+            )
         # 文件先出现又全部消失：按需求判定为下载失败。
         if seen_any and matched_count == 0:
             raise RuntimeError(f"download_id={download_id} 文件已消失，判定下载失败")
