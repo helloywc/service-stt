@@ -22,7 +22,6 @@ import uuid
 import json
 import pymysql
 from pymysql.cursors import DictCursor
-import yt_dlp
 from dotenv import dotenv_values
 
 class CustomRequestHandler(WSGIHandler):
@@ -446,14 +445,18 @@ def _merge_dotenv_files(*rel_paths):
     return merged
 
 
+def _env_map_for_start_env(start_env: str):
+    """按 start env 合并 .env 配置并返回字典。"""
+    if start_env == "dev":
+        return _merge_dotenv_files(".env", ".env.development")
+    if start_env == "prod":
+        return _merge_dotenv_files(".env", ".env.production")
+    raise ValueError("env 只能是 dev 或 prod")
+
+
 def _pymysql_connect_kw_for_start_env(start_env: str):
     """start 入参 env 为 dev|prod：用 .env + 对应环境文件的 DB_PORT 等连接数据库。"""
-    if start_env == "dev":
-        m = _merge_dotenv_files(".env", ".env.development")
-    elif start_env == "prod":
-        m = _merge_dotenv_files(".env", ".env.production")
-    else:
-        raise ValueError("env 只能是 dev 或 prod")
+    m = _env_map_for_start_env(start_env)
 
     def pick(key, default=None):
         if key in m and m[key] is not None:
@@ -475,6 +478,26 @@ def _pymysql_connect_kw_for_start_env(start_env: str):
     }
 
 
+def _download_path_for_start_env(start_env: str):
+    """读取下载目录（.env + 环境专用 .env），默认 /Users/wilson/Movies/service-stt-download。"""
+    m = _env_map_for_start_env(start_env)
+    path = (m.get("DOWNLOAD_PATH") or os.getenv("DOWNLOAD_PATH") or "/Users/wilson/Movies/service-stt-download").strip()
+    if not path:
+        path = "/Users/wilson/Movies/service-stt-download"
+    return path
+
+
+def _download_timeout_sec_for_start_env(start_env: str):
+    """读取下载超时秒数，默认 900 秒。"""
+    m = _env_map_for_start_env(start_env)
+    raw = (m.get("DOWNLOAD_TIMEOUT_SEC") or os.getenv("DOWNLOAD_TIMEOUT_SEC") or "900").strip()
+    try:
+        sec = int(raw)
+    except (TypeError, ValueError):
+        sec = 900
+    return max(sec, 10)
+
+
 def _record_stop_to_db(db_kw: dict, env_label: str, reason: str):
     """将停止原因写入当前任务使用的数据库（表 stt_stop_log，见 schema/table.sql）。"""
     table = os.getenv("STT_STOP_LOG_TABLE", "stt_stop_log").strip() or "stt_stop_log"
@@ -494,41 +517,139 @@ def _record_stop_to_db(db_kw: dict, env_label: str, reason: str):
         conn.close()
 
 
-def _download_bilibili_audio(video_url, cookies_str, out_dir, video_id):
-    """用 yt-dlp 下载 B 站视频音频到 out_dir，转为 16k 单声道 wav，返回 wav 文件路径。"""
-    safe_id = re.sub(r"[^\w\-]", "_", str(video_id))[:64]
-    out_tmpl = os.path.join(out_dir, f"{safe_id}_audio.%(ext)s")
-    wav_path = os.path.join(out_dir, f"{safe_id}_audio.wav")
-    opts = {
-        "outtmpl": out_tmpl,
-        "format": "bestaudio/best",
-        "quiet": True,
-        "no_warnings": True,
-        "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "wav", "preferredquality": None}
-        ],
-    }
-    if cookies_str:
-        opts["http_headers"] = {"Cookie": cookies_str}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([video_url])
-    if not os.path.isfile(wav_path):
-        raise RuntimeError("yt-dlp 未生成 wav 文件")
-    # 转为 16k 单声道供 whisper
-    rs = tool.runffmpeg(["-i", wav_path, "-ar", "16000", "-ac", "1", "-y", wav_path + ".16k.wav"])
+def _trigger_download_via_applescript(video_url: str):
+    """通过 AppleScript 触发 Downie 4 下载。"""
+    if sys.platform != "darwin":
+        raise RuntimeError("当前系统非 macOS，无法通过 AppleScript 控制 Downie 4")
+    if not video_url:
+        raise ValueError("video_url 不能为空")
+    script = (
+        "on run argv\n"
+        "set video_url to item 1 of argv\n"
+        'tell application "Downie 4" to activate\n'
+        'do shell script "open -a " & quoted form of "Downie 4" & " " & quoted form of video_url\n'
+        "end run"
+    )
+    rs = subprocess.run(
+        ["osascript", "-e", script, "--", video_url],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if rs.returncode != 0:
+        err = (rs.stderr or rs.stdout or "").strip() or "unknown error"
+        raise RuntimeError(f"AppleScript 触发下载失败: {err}")
+    print(f"[start] AppleScript 已触发下载, url={video_url}")
+
+
+def _wait_downie_download(download_path: str, download_id: str, timeout_sec: int = 900):
+    """
+    监控 Downie 下载目录，返回 (video_path, meta_json_path, srt_path_or_none)。
+    判定规则：
+    - 下载中：存在 *-{download_id}.downiepart
+    - 下载完成：存在 *-{download_id}.mp4 且 *-{download_id}.json
+    """
+    os.makedirs(download_path, exist_ok=True)
+    # 严格匹配：<任意标题>-<download_id>.<ext>
+    filename_re = re.compile(
+        rf"^.+-{re.escape(str(download_id))}\.(downiepart|mp4|json|srt)$",
+        re.IGNORECASE,
+    )
+    deadline = time.time() + max(timeout_sec, 10)
+    seen_any = False
+    last_state = None
+    while True:
+        if getattr(cfg, "STOP_START", False):
+            raise RuntimeError("下载监控被停止")
+        if time.time() > deadline:
+            raise TimeoutError(f"等待 Downie 下载超时: download_id={download_id}")
+        try:
+            names = os.listdir(download_path)
+        except FileNotFoundError:
+            names = []
+        mp4_name = None
+        json_name = None
+        srt_name = None
+        downloading = False
+        downiepart_name = None
+        matched_count = 0
+        for name in names:
+            m = filename_re.match(name)
+            if not m:
+                continue
+            seen_any = True
+            matched_count += 1
+            ext = m.group(1).lower()
+            if ext == "downiepart":
+                downloading = True
+                downiepart_name = name
+            elif ext == "mp4":
+                mp4_name = name
+            elif ext == "json":
+                json_name = name
+            elif ext == "srt":
+                srt_name = name
+        cur_state = (bool(seen_any), matched_count, bool(downloading), mp4_name or "", json_name or "", srt_name or "", downiepart_name or "")
+        if cur_state != last_state:
+            print(
+                f"[start] download_id={download_id} 监控状态 "
+                f"count={matched_count} "
+                f"downloading={downloading} "
+                f"downiepart={downiepart_name or '-'} "
+                f"mp4={mp4_name or '-'} json={json_name or '-'} srt={srt_name or '-'}"
+            )
+            last_state = cur_state
+        # 文件先出现又全部消失：按需求判定为下载失败。
+        if seen_any and matched_count == 0:
+            raise RuntimeError(f"download_id={download_id} 文件已消失，判定下载失败")
+        # 3个文件：mp4 + json + srt => 下载成功且有字幕
+        if (not downloading) and mp4_name and json_name and srt_name and matched_count >= 3:
+            print(
+                f"[start] download_id={download_id} 下载完成(有字幕) "
+                f"mp4={mp4_name} json={json_name} srt={srt_name or '-'}"
+            )
+            return (
+                os.path.join(download_path, mp4_name),
+                os.path.join(download_path, json_name),
+                os.path.join(download_path, srt_name) if srt_name else None,
+            )
+        # 2个文件：mp4 + json => 下载成功无字幕
+        if (not downloading) and mp4_name and json_name and (not srt_name) and matched_count >= 2:
+            print(
+                f"[start] download_id={download_id} 下载完成(无字幕) "
+                f"mp4={mp4_name} json={json_name}"
+            )
+            return (
+                os.path.join(download_path, mp4_name),
+                os.path.join(download_path, json_name),
+                None,
+            )
+        # 固定每 5 秒轮询
+        time.sleep(5)
+
+
+def _video_to_wav_for_stt(video_path: str):
+    """将视频转为 16k 单声道 wav，返回 wav 路径。"""
+    wav_path = video_path + ".stt.wav"
+    rs = tool.runffmpeg(["-i", video_path, "-ar", "16000", "-ac", "1", "-y", wav_path])
     if rs != "ok":
-        raise RuntimeError(f"ffmpeg 转码失败: {rs}")
-    os.replace(wav_path + ".16k.wav", wav_path)
+        raise RuntimeError(f"ffmpeg 转音频失败: {rs}")
+    if not os.path.isfile(wav_path):
+        raise RuntimeError("ffmpeg 未生成 wav 文件")
     return wav_path
 
 
-def _run_start_task(platform: str, start_env: str):
-    """实际执行 bilibili_video 批量处理任务的后台函数。"""
+def _run_start_task(start_env: str):
+    """实际执行 /start 新流程：Downie 下载监控 + 字幕优先 + 无字幕 STT。"""
     db_kw = _pymysql_connect_kw_for_start_env(start_env)
+    download_path = _download_path_for_start_env(start_env)
+    download_timeout_sec = _download_timeout_sec_for_start_env(start_env)
     print(
         "[start] 当前数据库配置 (env=%s):" % start_env,
         f"host={db_kw['host']} port={db_kw['port']} user={db_kw['user']} password=**** database={db_kw['database']}",
     )
+    print("[start] 下载目录:", download_path)
+    print("[start] 下载超时(秒):", download_timeout_sec)
     cfg.START_RUNNING = True
     cfg.STOP_START = False
     conn = None
@@ -576,15 +697,21 @@ def _run_start_task(platform: str, start_env: str):
                     # 该记录已被其他任务锁定，跳过继续取下一条
                     continue
 
-            video_id = row.get("video_id") or row.get("bvid") or row.get("id")
-            video_url = (
-                row.get("video_url")
-                or row.get("video_download_url")
-                or row.get("audio_download_url")
-                or ""
-            ).strip()
+            download_id = str((row.get("download_id") or "")).strip()
+            # Downie 触发下载必须使用视频页地址（如 bilibili.com/video/BV...）
+            video_url = (row.get("video_url") or "").strip()
+            if not download_id:
+                err_msg = "该条记录缺少 download_id"
+                cfg.LAST_ERROR_MSG = err_msg
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE bilibili_video SET status = -1, remark = %s WHERE id = %s",
+                        (err_msg, row_id),
+                    )
+                    conn.commit()
+                continue
             if not video_url:
-                err_msg = "该条记录无视频/音频地址"
+                err_msg = "该条记录无 video_url"
                 cfg.LAST_ERROR_MSG = err_msg
                 with conn.cursor() as cur:
                     cur.execute(
@@ -597,22 +724,23 @@ def _run_start_task(platform: str, start_env: str):
 
             wav_path = None
             try:
-                # 从 crawler_cookies_account 取 platform 对应 cookies
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT cookies FROM crawler_cookies_account WHERE platform_name = %s AND is_deleted = 0 AND status = 0 ORDER BY priority DESC LIMIT 1",
-                        (platform,),
-                    )
-                    acc = cur.fetchone()
-                cookies_str = _cookies_header_from_db(acc["cookies"]) if acc and acc.get("cookies") else None
-                # 下载音频到 static/tmp
-                wav_path = _download_bilibili_audio(video_url, cookies_str, cfg.TMP_DIR, video_id)
-                # 调用本地转写：语言 zh，模型 small
-                text = _api_process(
-                    model_name="small", wav_file=wav_path, language="zh", response_format="text"
+                _trigger_download_via_applescript(video_url)
+                video_path, meta_path, srt_path = _wait_downie_download(
+                    download_path, download_id, timeout_sec=download_timeout_sec
                 )
-                if not (isinstance(text, str) and text.strip()):
-                    text = ""
+                text = ""
+                if srt_path and os.path.isfile(srt_path):
+                    with open(srt_path, "r", encoding="utf-8", errors="ignore") as f:
+                        text = (f.read() or "").strip()
+                    print(f"[start] download_id={download_id} 命中字幕文件，直接入库: {srt_path}")
+                else:
+                    wav_path = _video_to_wav_for_stt(video_path)
+                    text = _api_process(
+                        model_name="small", wav_file=wav_path, language="zh", response_format="text"
+                    )
+                    if not (isinstance(text, str) and text.strip()):
+                        text = ""
+                    print(f"[start] download_id={download_id} 未命中字幕，已走语音识别。meta={meta_path}")
                 # 成功：写回 context，清空下载地址，status=1
                 with conn.cursor() as cur:
                     cur.execute(
@@ -645,11 +773,11 @@ def _run_start_task(platform: str, start_env: str):
                 # 跳过当前记录，继续处理下一条
                 continue
             finally:
-                # 无论成功或失败，删除已下载的音频文件
+                # 无论成功或失败，删除临时 wav 文件
                 if wav_path and os.path.isfile(wav_path):
                     try:
                         os.remove(wav_path)
-                        print("[start] 已删除临时音频:", wav_path)
+                        print("[start] 已删除临时 wav:", wav_path)
                     except OSError:
                         pass
     finally:
@@ -678,11 +806,10 @@ def _open_downie4_via_applescript():
 
 @app.route('/start', methods=['POST'])
 def start():
-    """触发 bilibili_video 批量处理任务，立即返回，不等待解析完成。"""
+    """触发 bilibili_video 批量处理任务（仅新流程），立即返回，不等待解析完成。"""
     try:
         body = request.get_json(silent=True) or {}
         table = request.form.get("table") or body.get("table")
-        platform = request.form.get("platform") or body.get("platform") or "bili"
         start_env = (request.form.get("env") or body.get("env") or "").strip().lower()
         if not table:
             return jsonify({"code": 500, "message": "缺少参数 table"}), 500
@@ -699,10 +826,10 @@ def start():
             return jsonify({"code": 500, "message": str(e)}), 500
         cfg.START_TASK_DB_KWARGS = {k: v for k, v in _pre_kw.items()}
         cfg.START_TASK_ENV_LABEL = start_env
-        # 后台启动任务线程（与上方 DB 配置一致，供 /start/stop 写入同一库）
-        t = threading.Thread(target=_run_start_task, args=(platform, start_env), daemon=True)
+        # 后台启动任务线程（仅 Downie 新流程，与上方 DB 配置一致，供 /start/stop 写入同一库）
+        t = threading.Thread(target=_run_start_task, args=(start_env,), daemon=True)
         t.start()
-        return jsonify({"code": 200, "message": "任务已启动"}), 200
+        return jsonify({"code": 200, "message": "任务已启动（Downie 新流程）"}), 200
     except Exception as e:
         cfg.LAST_ERROR_MSG = str(e)
         app.logger.error(f"[start] error: {e}")
@@ -793,8 +920,8 @@ if __name__ == '__main__':
             # 根据环境变量控制是否打开浏览器，默认打开
             if os.getenv("START_OPEN_WEB", "1") == "1":
                 threading.Thread(target=tool.openweb, args=(cfg.web_address,)).start()
-            # 根据环境变量控制是否联动打开 Downie 4，默认打开
-            if os.getenv("START_OPEN_DOWNIE4", "1") == "1":
+            # 根据环境变量控制是否联动打开 Downie 4（默认关闭，主流程使用 ssh 命令触发下载）
+            if os.getenv("START_OPEN_DOWNIE4", "0") == "1":
                 threading.Thread(target=_open_downie4_via_applescript, daemon=True).start()
             http_server.serve_forever()
         finally:
