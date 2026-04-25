@@ -639,6 +639,38 @@ def _video_to_wav_for_stt(video_path: str):
     return wav_path
 
 
+def _cleanup_download_files(*paths):
+    """删除下载流程产生的文件（存在才删，失败不中断主流程）。"""
+    for p in paths:
+        if not p:
+            continue
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+                print(f"[start] 已清理文件: {p}")
+        except OSError as e:
+            app.logger.warning(f"[start] 清理文件失败: {p}, err={e}")
+
+
+def _srt_to_plain_text(srt_content: str):
+    """将 SRT 字幕转换为纯文本（去序号、去时间轴、保留正文逐行）。"""
+    if not srt_content:
+        return ""
+    lines = []
+    for raw in srt_content.splitlines():
+        line = (raw or "").strip()
+        if not line:
+            continue
+        # 跳过字幕序号行
+        if line.isdigit():
+            continue
+        # 跳过时间轴行，例如 00:00:00,040 --> 00:00:01,879
+        if re.match(r"^\d{2}:\d{2}:\d{2}[,.]\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}[,.]\d{3}$", line):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def _run_start_task(start_env: str):
     """实际执行 /start 新流程：Downie 下载监控 + 字幕优先 + 无字幕 STT。"""
     db_kw = _pymysql_connect_kw_for_start_env(start_env)
@@ -723,6 +755,9 @@ def _run_start_task(start_env: str):
                 continue
 
             wav_path = None
+            video_path = None
+            meta_path = None
+            srt_path = None
             try:
                 _trigger_download_via_applescript(video_url)
                 video_path, meta_path, srt_path = _wait_downie_download(
@@ -731,7 +766,7 @@ def _run_start_task(start_env: str):
                 text = ""
                 if srt_path and os.path.isfile(srt_path):
                     with open(srt_path, "r", encoding="utf-8", errors="ignore") as f:
-                        text = (f.read() or "").strip()
+                        text = _srt_to_plain_text(f.read() or "")
                     print(f"[start] download_id={download_id} 命中字幕文件，直接入库: {srt_path}")
                 else:
                     wav_path = _video_to_wav_for_stt(video_path)
@@ -760,6 +795,8 @@ def _run_start_task(start_env: str):
                     "[start] bilibili_video 一条记录已写回 context，已清空下载地址，status=1，累计处理:",
                     processed,
                 )
+                # 入库成功后，清理本次下载相关文件（视频、元数据、字幕、临时 wav）
+                _cleanup_download_files(video_path, meta_path, srt_path, wav_path)
             except Exception as inner_e:
                 err_msg = str(inner_e)[:512]
                 cfg.LAST_ERROR_MSG = err_msg
@@ -773,7 +810,7 @@ def _run_start_task(start_env: str):
                 # 跳过当前记录，继续处理下一条
                 continue
             finally:
-                # 无论成功或失败，删除临时 wav 文件
+                # 无论成功或失败，删除临时 wav 文件（成功场景已删除，此处兜底）
                 if wav_path and os.path.isfile(wav_path):
                     try:
                         os.remove(wav_path)
