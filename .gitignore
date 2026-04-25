@@ -16,4 +16,6 @@ ffmpeg
 static/tmp
 static/file
 stslib/__pycache__
+__pycache__/
+*.pyc
 models

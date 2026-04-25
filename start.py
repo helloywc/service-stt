@@ -3,6 +3,7 @@ import re
 import threading
 import sys
 import argparse
+import subprocess
 import torch
 from flask import Flask, request, render_template, jsonify, send_from_directory, Response
 from flask_cors import CORS
@@ -659,6 +660,22 @@ def _run_start_task(platform: str, start_env: str):
             conn.close()
 
 
+def _open_downie4_via_applescript():
+    """在 macOS 上通过 AppleScript 激活 Downie 4。"""
+    if sys.platform != "darwin":
+        return
+    script = 'tell application "Downie 4" to activate'
+    try:
+        subprocess.run(
+            ["osascript", "-e", script],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        app.logger.warning(f"[boot] 打开 Downie 4 失败: {e}")
+
+
 @app.route('/start', methods=['POST'])
 def start():
     """触发 bilibili_video 批量处理任务，立即返回，不等待解析完成。"""
@@ -776,6 +793,9 @@ if __name__ == '__main__':
             # 根据环境变量控制是否打开浏览器，默认打开
             if os.getenv("START_OPEN_WEB", "1") == "1":
                 threading.Thread(target=tool.openweb, args=(cfg.web_address,)).start()
+            # 根据环境变量控制是否联动打开 Downie 4，默认打开
+            if os.getenv("START_OPEN_DOWNIE4", "1") == "1":
+                threading.Thread(target=_open_downie4_via_applescript, daemon=True).start()
             http_server.serve_forever()
         finally:
             if http_server:
