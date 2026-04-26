@@ -23,6 +23,7 @@ import json
 import pymysql
 from pymysql.cursors import DictCursor
 from dotenv import dotenv_values
+from datetime import datetime
 
 class CustomRequestHandler(WSGIHandler):
     def log_request(self):
@@ -517,6 +518,16 @@ def _record_stop_to_db(db_kw: dict, env_label: str, reason: str):
         conn.close()
 
 
+def _start_log(message: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [start] {message}")
+
+
+def _start_log_error(message: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\033[31m[{ts}] [start] {message}\033[0m")
+
+
 def _trigger_download_via_applescript(video_url: str):
     """通过 AppleScript 触发 Downie 4 下载。"""
     if sys.platform != "darwin":
@@ -539,7 +550,7 @@ def _trigger_download_via_applescript(video_url: str):
     if rs.returncode != 0:
         err = (rs.stderr or rs.stdout or "").strip() or "unknown error"
         raise RuntimeError(f"AppleScript 触发下载失败: {err}")
-    print(f"[start] AppleScript 已触发下载, url={video_url}")
+    _start_log(f"AppleScript 已触发下载, url={video_url}")
 
 
 def _wait_downie_download(download_path: str, download_id: str, timeout_sec: int = 900, no_file_grace_sec: int = 60):
@@ -593,8 +604,8 @@ def _wait_downie_download(download_path: str, download_id: str, timeout_sec: int
                 srt_name = name
         cur_state = (bool(seen_any), matched_count, bool(downloading), mp4_name or "", json_name or "", srt_name or "", downiepart_name or "")
         if cur_state != last_state:
-            print(
-                f"[start] download_id={download_id} 监控状态 "
+            _start_log(
+                f"download_id={download_id} 监控状态 "
                 f"count={matched_count} "
                 f"downloading={downloading} "
                 f"downiepart={downiepart_name or '-'} "
@@ -611,8 +622,8 @@ def _wait_downie_download(download_path: str, download_id: str, timeout_sec: int
             raise RuntimeError(f"download_id={download_id} 文件已消失，判定下载失败")
         # 3个文件：mp4 + json + srt => 下载成功且有字幕
         if (not downloading) and mp4_name and json_name and srt_name and matched_count >= 3:
-            print(
-                f"[start] download_id={download_id} 下载完成(有字幕) "
+            _start_log(
+                f"download_id={download_id} 下载完成(有字幕) "
                 f"mp4={mp4_name} json={json_name} srt={srt_name or '-'}"
             )
             return (
@@ -622,8 +633,8 @@ def _wait_downie_download(download_path: str, download_id: str, timeout_sec: int
             )
         # 2个文件：mp4 + json => 下载成功无字幕
         if (not downloading) and mp4_name and json_name and (not srt_name) and matched_count >= 2:
-            print(
-                f"[start] download_id={download_id} 下载完成(无字幕) "
+            _start_log(
+                f"download_id={download_id} 下载完成(无字幕) "
                 f"mp4={mp4_name} json={json_name}"
             )
             return (
@@ -654,7 +665,7 @@ def _cleanup_download_files(*paths):
         try:
             if os.path.isfile(p):
                 os.remove(p)
-                print(f"[start] 已清理文件: {p}")
+                _start_log(f"已清理文件: {p}")
         except OSError as e:
             app.logger.warning(f"[start] 清理文件失败: {p}, err={e}")
 
@@ -683,12 +694,14 @@ def _run_start_task(start_env: str):
     db_kw = _pymysql_connect_kw_for_start_env(start_env)
     download_path = _download_path_for_start_env(start_env)
     download_timeout_sec = _download_timeout_sec_for_start_env(start_env)
-    print(
-        "[start] 当前数据库配置 (env=%s):" % start_env,
+    _start_log(
+        "当前数据库配置 (env=%s): %s" % (
+            start_env,
         f"host={db_kw['host']} port={db_kw['port']} user={db_kw['user']} password=**** database={db_kw['database']}",
+        )
     )
-    print("[start] 下载目录:", download_path)
-    print("[start] 下载超时(秒):", download_timeout_sec)
+    _start_log(f"下载目录: {download_path}")
+    _start_log(f"下载超时(秒): {download_timeout_sec}")
     cfg.START_RUNNING = True
     cfg.STOP_START = False
     conn = None
@@ -712,7 +725,7 @@ def _run_start_task(start_env: str):
             # 若收到停止指令，则退出循环
             if getattr(cfg, "STOP_START", False):
                 cfg.STOP_START = False
-                print("[start] 收到停止指令，已停止任务，processed =", processed)
+                _start_log(f"收到停止指令，已停止任务，processed={processed}")
                 break
 
             with conn.cursor() as cur:
@@ -721,7 +734,7 @@ def _run_start_task(start_env: str):
                 )
                 row = cur.fetchone()
             if not row:
-                print("[start] 没有待处理的 bilibili_video 记录，已结束任务，processed =", processed)
+                _start_log(f"没有待处理的 bilibili_video 记录，已结束任务，processed={processed}")
                 break
 
             row_id = row["id"]
@@ -774,7 +787,7 @@ def _run_start_task(start_env: str):
                 if srt_path and os.path.isfile(srt_path):
                     with open(srt_path, "r", encoding="utf-8", errors="ignore") as f:
                         text = _srt_to_plain_text(f.read() or "")
-                    print(f"[start] download_id={download_id} 命中字幕文件，直接入库: {srt_path}")
+                    _start_log(f"download_id={download_id} 命中字幕文件，直接入库: {srt_path}")
                 else:
                     wav_path = _video_to_wav_for_stt(video_path)
                     text = _api_process(
@@ -782,7 +795,7 @@ def _run_start_task(start_env: str):
                     )
                     if not (isinstance(text, str) and text.strip()):
                         text = ""
-                    print(f"[start] download_id={download_id} 未命中字幕，已走语音识别。meta={meta_path}")
+                    _start_log(f"download_id={download_id} 未命中字幕，已走语音识别。meta={meta_path}")
                 # 成功：写回 context，清空下载地址，status=1
                 with conn.cursor() as cur:
                     cur.execute(
@@ -798,10 +811,7 @@ def _run_start_task(start_env: str):
                 data["locked"] = 0
                 last_data = data
                 processed += 1
-                print(
-                    "[start] bilibili_video 一条记录已写回 context，已清空下载地址，status=1，累计处理:",
-                    processed,
-                )
+                _start_log(f"bilibili_video 一条记录已写回 context，已清空下载地址，status=1，累计处理: {processed}")
                 # 入库成功后，清理本次下载相关文件（视频、元数据、字幕、临时 wav）
                 _cleanup_download_files(video_path, meta_path, srt_path, wav_path)
             except Exception as inner_e:
@@ -813,6 +823,7 @@ def _run_start_task(start_env: str):
                         (err_msg, row_id),
                     )
                     conn.commit()
+                _start_log_error(f"error: {inner_e}")
                 app.logger.error(f"[start] error: {inner_e}")
                 # 跳过当前记录，继续处理下一条
                 continue
@@ -821,7 +832,7 @@ def _run_start_task(start_env: str):
                 if wav_path and os.path.isfile(wav_path):
                     try:
                         os.remove(wav_path)
-                        print("[start] 已删除临时 wav:", wav_path)
+                        _start_log(f"已删除临时 wav: {wav_path}")
                     except OSError:
                         pass
     finally:
