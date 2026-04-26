@@ -553,19 +553,30 @@ def _trigger_download_via_applescript(video_url: str):
     _start_log(f"AppleScript 已触发下载, url={video_url}")
 
 
-def _wait_downie_download(download_path: str, download_id: str, timeout_sec: int = 900, no_file_grace_sec: int = 60):
+def _wait_downie_download(
+    download_path: str,
+    download_id: str,
+    title: str = "",
+    timeout_sec: int = 900,
+    no_file_grace_sec: int = 60,
+):
     """
     监控 Downie 下载目录，返回 (video_path, meta_json_path, srt_path_or_none)。
-    判定规则：
-    - 下载中：存在 *-{download_id}.downiepart
-    - 下载完成：存在 *-{download_id}.mp4 且 *-{download_id}.json
+
+    单文件是否属于本任务，采用「或」关系（二选一，不是先后、也不是必须同时满足）：
+    - 规则 A：文件名匹配 `*-{download_id}.(mp4|json|srt|downiepart)`；
+    - 规则 B：无 download_id 后缀时，用 title 前 20 个字符与文件名（忽略大小写）前缀比对。
+    满足 A 或 B 之一即计为本任务相关文件，再按扩展名聚合成状态。
     """
     os.makedirs(download_path, exist_ok=True)
-    # 严格匹配：<任意标题>-<download_id>.<ext>
+    # 规则 A：严格匹配 <任意标题>-<download_id>.<ext>
     filename_re = re.compile(
         rf"^.+-{re.escape(str(download_id))}\.(downiepart|mp4|json|srt)$",
         re.IGNORECASE,
     )
+    # 规则 B：title 前 20 个字符与文件名开头一致（用于超长/被截断而无 download_id 后缀的文件名）
+    title_prefix = (title or "").strip()[:20]
+    title_prefix_match = title_prefix.lower() if title_prefix else ""
     now = time.time()
     deadline = now + max(timeout_sec, 10)
     no_file_deadline = now + max(no_file_grace_sec, 5)
@@ -588,11 +599,37 @@ def _wait_downie_download(download_path: str, download_id: str, timeout_sec: int
         matched_count = 0
         for name in names:
             m = filename_re.match(name)
-            if not m:
+            by_id = bool(m)
+            by_title = False
+            if not by_id and title_prefix_match:
+                lowered = name.lower()
+                if lowered.startswith(title_prefix_match):
+                    if lowered.endswith(".downiepart"):
+                        by_title = True
+                    elif lowered.endswith(".mp4"):
+                        by_title = True
+                    elif lowered.endswith(".json"):
+                        by_title = True
+                    elif lowered.endswith(".srt"):
+                        by_title = True
+            if not (by_id or by_title):
                 continue
+            if by_id:
+                ext = m.group(1).lower()
+            else:
+                lowered = name.lower()
+                if lowered.endswith(".downiepart"):
+                    ext = "downiepart"
+                elif lowered.endswith(".mp4"):
+                    ext = "mp4"
+                elif lowered.endswith(".json"):
+                    ext = "json"
+                elif lowered.endswith(".srt"):
+                    ext = "srt"
+                else:
+                    continue
             seen_any = True
             matched_count += 1
-            ext = m.group(1).lower()
             if ext == "downiepart":
                 downloading = True
                 downiepart_name = name
@@ -750,6 +787,7 @@ def _run_start_task(start_env: str):
                     continue
 
             download_id = str((row.get("download_id") or "")).strip()
+            title = str((row.get("title") or "")).strip()
             # Downie 触发下载必须使用视频页地址（如 bilibili.com/video/BV...）
             video_url = (row.get("video_url") or "").strip()
             if not download_id:
@@ -781,7 +819,10 @@ def _run_start_task(start_env: str):
             try:
                 _trigger_download_via_applescript(video_url)
                 video_path, meta_path, srt_path = _wait_downie_download(
-                    download_path, download_id, timeout_sec=download_timeout_sec
+                    download_path,
+                    download_id,
+                    title=title,
+                    timeout_sec=download_timeout_sec,
                 )
                 text = ""
                 if srt_path and os.path.isfile(srt_path):
